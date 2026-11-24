@@ -1,0 +1,7 @@
+libname,memname,name,type,length,varnum,format,informat
+WORK,ORDERS,Order_ID,numeric,8,1,,
+WORK,ORDERS,Region,character,12,2,,
+WORK,ORDERS,Order_Date,date,8,3,DATE9.,ANYDTDTE.
+WORK,ORDERS,Shipped_At,datetime,8,4,DATETIME20.,ANYDTDTM.
+WORK,ORDERS,Cutoff_Time,time,8,5,TIME8.,TIME.
+WORK,ORDERS,Amount,numeric,8,6,DOLLAR12.2,

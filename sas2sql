@@ -1,0 +1,204 @@
+#!/usr/bin/env lua
+
+local posix = package.config:sub(1, 1) == '/'
+local parent_pattern = posix and '^(.*/)' or '^(.*[/\\])'
+local script_dir = arg[0]:match(parent_pattern) or './'
+package.path = script_dir .. '?.lua;' .. package.path
+
+local usage = [[
+Usage: sas2sql --input program.sas --schema schema.csv --target spark --output result.sql
+
+  -i, --input PATH       SAS source file
+  -s, --schema PATH      CSV with metadata for external input datasets
+  -t, --target DIALECT   spark, pyspark, postgres, postgresql, sqlserver, oracle, snowflake
+  -o, --output PATH      SQL file, or - for standard output
+      --compiler-root PATH        Path to an unpacked sas2sql compiler
+      --spark-table-provider NAME parquet (default) or iceberg
+      --collapse-special-missing  Allow special SAS numeric missings to become SQL NULL
+  -h, --help             Show this help
+]]
+
+local flags = {
+  ['-i']='input', ['--input']='input',
+  ['-s']='schema', ['--schema']='schema',
+  ['-t']='target', ['--target']='target', ['--dialect']='target',
+  ['-o']='output', ['--output']='output',
+  ['--compiler-root']='compiler_root', ['--spark-table-provider']='spark_table_provider',
+}
+local targets = {
+  spark=true, pyspark=true, postgres=true, postgresql=true,
+  sqlserver=true, oracle=true, snowflake=true,
+}
+
+local function fail(message)
+  error(message, 0)
+end
+
+local function parse_args()
+  local options = {}
+  local i = 1
+  while i <= #arg do
+    local flag, value = arg[i]:match('^(%-%-[^=]+)=(.*)$')
+    flag = flag or arg[i]
+    local key = flags[flag]
+    if key then
+      if not value then
+        i = i + 1
+        value = arg[i]
+        if value and value ~= '-' and value:sub(1, 1) == '-' then value = nil end
+      end
+      if not value or value == '' then fail(flag .. ' requires a value') end
+      if options[key] then fail('Duplicate option ' .. flag) end
+      options[key] = value
+    elseif arg[i] == '--collapse-special-missing' then
+      options.collapse = true
+    elseif arg[i] == '--help' or arg[i] == '-h' then
+      return nil
+    else
+      fail('Unknown option ' .. arg[i])
+    end
+    i = i + 1
+  end
+  for _, key in ipairs({'input', 'schema', 'target', 'output'}) do
+    if not options[key] then fail('Missing required option --' .. key) end
+  end
+  options.target = options.target:lower()
+  if not targets[options.target] then fail('Unknown target ' .. options.target) end
+  local provider = options.spark_table_provider
+  if provider then
+    if options.target ~= 'spark' and options.target ~= 'pyspark' then
+      fail('--spark-table-provider requires a Spark target')
+    end
+    if provider ~= 'parquet' and provider ~= 'iceberg' then
+      fail('--spark-table-provider must be parquet or iceberg')
+    end
+  end
+  return options
+end
+
+local function read_file(path)
+  local file, issue = io.open(path, 'rb')
+  if not file then fail(issue) end
+  local content, read_issue = file:read('*a')
+  file:close()
+  if not content then fail(path .. ': ' .. read_issue) end
+  return (content:gsub('^\239\187\191', ''))
+end
+
+local function load_compiler(root)
+  local explicit_root = root ~= nil
+  root = root or script_dir .. '../sas2sql'
+  local source = root .. '/src'
+  local entry = io.open(source .. '/sas2sql/init.lua', 'rb')
+  if entry then
+    entry:close()
+    package.path = source .. '/?.lua;' .. source .. '/?/init.lua;' .. package.path
+  elseif explicit_root then
+    fail('Cannot find src/sas2sql/init.lua under ' .. root)
+  end
+
+  local ok, compiler = pcall(require, 'sas2sql')
+  if not ok then
+    fail('Could not load sas2sql. Install the compiler or set --compiler-root.\n' .. tostring(compiler))
+  end
+  return compiler
+end
+
+local function show_diagnostics(path, diagnostics)
+  for _, diagnostic in ipairs(diagnostics) do
+    local location, span = path, diagnostic.span
+    if span and span.start_line and span.start_col then
+      location = ('%s:%d:%d'):format(path, span.start_line, span.start_col)
+    end
+    io.stderr:write(('%s: %s [%s] %s\n'):format(
+      location, diagnostic.severity, diagnostic.code, diagnostic.message))
+  end
+end
+
+local function write_output(options, sql)
+  local path = options.output
+  if path == '-' then
+    local ok, issue = io.stdout:write(sql)
+    if ok then ok, issue = io.stdout:flush() end
+    if not ok then fail(issue) end
+    return
+  end
+
+  local lfs = require('lfs')
+  local destination = lfs.attributes(path)
+  for _, input in ipairs({options.input, options.schema}) do
+    local original = posix and destination and lfs.attributes(input)
+    if path == input or (original and original.dev == destination.dev and original.ino == destination.ino) then
+      fail('Output path must differ from the SAS input and the schema')
+    end
+  end
+
+  -- Stage on the destination filesystem so the rename publishes the whole bundle.
+  local ticket = os.tmpname()
+  local parent = path:match(parent_pattern) or './'
+  local directory = parent .. '.sas2sql-' .. ticket:match('[^/\\]+$')
+  local created, mkdir_issue = lfs.mkdir(directory)
+  os.remove(ticket)
+  if not created then fail(('Cannot write %s (%s)'):format(path, mkdir_issue)) end
+
+  local staged = directory .. '/bundle.sql'
+  local file, issue = io.open(staged, 'wb')
+  local ok
+  if file then
+    local written, write_issue = file:write(sql)
+    local closed, close_issue = file:close()
+    if written and closed then
+      ok, issue = os.rename(staged, path)
+    else
+      issue = write_issue or close_issue
+    end
+    if not ok then os.remove(staged) end
+  end
+  lfs.rmdir(directory)
+  if not ok then fail(('Cannot write %s (%s)'):format(path, issue)) end
+end
+
+local function run(options)
+  local source = read_file(options.input)
+  local schema_file = read_file(options.schema)
+  local schema = require('schema_csv').parse(schema_file, options.schema)
+  local compiler = load_compiler(options.compiler_root)
+  local result = compiler.transpile(source, {
+    dialect = options.target,
+    schema_provider = schema,
+    spark_table_provider = options.spark_table_provider,
+    missing_policy = options.collapse and 'collapse' or 'preserve',
+    strict = not options.collapse,
+  })
+
+  show_diagnostics(options.input, result.diagnostics)
+  if not result.ok then
+    if #result.diagnostics == 0 then fail('Compilation did not produce a SQL bundle') end
+    return 1
+  end
+
+  local statements = {}
+  for i, statement in ipairs(result.sql.statements) do
+    statements[i] = statement.sql
+  end
+  local sql = #statements > 0 and table.concat(statements, '\n\n') .. '\n' or ''
+  write_output(options, sql)
+  return 0
+end
+
+local valid, options = pcall(parse_args)
+if not valid then
+  io.stderr:write('sas2sql: ' .. options .. '\nUse --help for usage.\n')
+  os.exit(2)
+end
+if not options then
+  io.stdout:write(usage)
+  return
+end
+
+local ok, status = pcall(run, options)
+if not ok then
+  io.stderr:write('sas2sql: ' .. tostring(status) .. '\n')
+  os.exit(1)
+end
+os.exit(status)
